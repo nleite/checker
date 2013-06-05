@@ -5,35 +5,91 @@ import pymongo
 import util
 import json
 
-def print_oplog_last_ts(host, ns, destination, user=None, password=None):
+def get_shard_nodes(host):
+    mc = MongoClient( host )
+    shard_coll = mc['config']['shards']
+    shard_cursor = shard_coll.find()
+    shards = [ x for x in shard_cursor ]
+    mc.disconnect()
+    return shards
+
+def validate_destination_file(destination):
+        source = open(destination, 'r')
+        try:
+            data = json.load(source)
+        except ValueError, e:       # empty file
+            import ipdb;ipdb.set_trace()
+            err_msg = "MongoConnector: Can't read oplog progress file."
+            reason = "It may be empty or corrupt."
+            print("%s %s %s" % (err_msg, reason, e))
+        source.close()
+        print "OK"
+
+
+def print_oplog_last_ts(host, origin, ns, destination, user=None, password=None):
     """Simply just print into a file the last timestamp
     """
-    #connect to the target
-    mc = MongoClient( host )
-    if password is not None:
-        mc['admin'].authenticate(user, password)
-    local = mc['local']
-    oplog = local['oplog.rs']
-    last_oplog_entry = oplog.find_one({'ns': ns},
+    #newst oplog entry
+    newst_oplog = 0
+
+    #get all shards from target url
+    target_shards = get_shard_nodes(host)
+    #go to all nodes of the shard and get the newst oplog operation.
+    for shard_doc in target_shards:
+        repl_set, hosts = shard_doc['host'].split('/')
+        shard_connection = MongoClient( hosts, replicaSet=repl_set )
+
+        local = shard_connection['local']
+        oplog = local['oplog.rs']
+        #collect the last timestamp for the oplog which is not a migration operation
+        last_oplog_entry = oplog.find_one({'ns': ns, 'fromMigrate':{'$exists':0}},
                                         sort=[('$natural',
                                         pymongo.DESCENDING)])
+        #check if the is a last entry
+        timestamp = util.bson_ts_to_long( last_oplog_entry['ts'] )
+        if timestamp > newst_oplog:
+            newst_oplog = timestamp
+
+    #get all shards from target url
+    origin_shards = get_shard_nodes(origin)
+
+
     with open(destination, 'w') as dest_file:
-        ts = last_oplog_entry['ts']
-        oplog_str = str(oplog)
-        timestamp = util.bson_ts_to_long(ts)
-        json_str = json.dumps([oplog_str, timestamp])
+        jsons = []
+        for shard_doc in origin_shards:
+            repl_set, hosts = shard_doc['host'].split('/')
+            shard_connection = MongoClient( hosts, replicaSet=repl_set )
+
+            local = shard_connection['local']
+            oplog = local['oplog.rs']
+
+            oplog_str = str(oplog)
+            jsons.append( [oplog_str, newst_oplog] )
         try:
+            json_str = json.dumps(jsons)
             dest_file.write(json_str)
             print json_str
-            dest_file.close()
         except IOError:
             dest_file.truncate()
             print "Problem writing to file %s" % destination
 
+    dest_file.close()
+    validate_destination_file(destination)
 
 
 if __name__ == '__main__':
     parser = optparse.OptionParser()
+    #-m is for the main address, which is a host:port pair, ideally of the
+    #mongos. For non sharded clusters, it can be the primary.
+    parser.add_option("-m", "--main", action="store", type="string",
+                      dest="main_addr", default="localhost:27217",
+                      help="""Specify the main address, which is a"""
+                      """ host:port pair. For sharded clusters,  this"""
+                      """ should be the mongos address. For individual"""
+                      """ replica sets, supply the address of the"""
+                      """ primary. For example, `-m localhost:27217`"""
+                      """ would be a valid argument to `-m`. Don't use"""
+                      """ quotes around the address""")
     #-o is to specify the oplog-config file. This file is used by the system
     #to store the last timestamp read on a specific oplog. This allows for
     #quick recovery from failure.
@@ -87,7 +143,7 @@ if __name__ == '__main__':
                       """must specify both an admin username and a keyFile."""
                       """The default username is '__system'""")
     (options, args) = parser.parse_args()
-    print_oplog_last_ts( options.target, options.ns_set, options.oplog_config,
+    print_oplog_last_ts( options.target, options.main_addr, options.ns_set, options.oplog_config,
             options.admin_name, options.password)
 
 
